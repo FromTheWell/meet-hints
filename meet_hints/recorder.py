@@ -22,12 +22,14 @@ class AudioRecorder:
         sample_rate: int = 16000,
         device_index: int | None = None,
         mic_device_index: int | None = None,
+        mic_only: bool = False,
     ):
         self.output_dir = Path(output_dir).resolve() / "audio"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_rate = sample_rate
         self.device_index = device_index
         self.mic_device_index = mic_device_index
+        self.mic_only = mic_only
 
         self._recording = False
         self._loopback_frames: list[bytes] = []
@@ -37,6 +39,7 @@ class AudioRecorder:
         self._loopback_stream = None
         self._mic_stream = None
         self._loopback_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
         self._p: pyaudio.PyAudio | None = None
         self._output_path: Path | None = None
 
@@ -73,51 +76,60 @@ class AudioRecorder:
         self._output_path = self.output_dir / f"meeting_{timestamp}.wav"
         self._loopback_frames = []
         self._mic_frames = []
+        self._stop_event.clear()
 
         self._p = pyaudio.PyAudio()
 
-        loopback_info = self._resolve_loopback(self._p)
-        mic_info = self._resolve_mic(self._p) if self.mic_device_index is not None else None
+        if not self.mic_only:
+            loopback_info = self._resolve_loopback(self._p)
+            self._loopback_info = loopback_info
+            print(f"Loopback: {loopback_info['name']} — "
+                  f"{int(loopback_info['maxInputChannels'])}ch "
+                  f"{int(loopback_info['defaultSampleRate'])}Hz "
+                  f"idx={int(loopback_info['index'])}")
+        else:
+            loopback_info = None
+            self._loopback_info = {}
 
-        self._loopback_info = loopback_info
+        mic_info = self._resolve_mic(self._p) if self.mic_device_index is not None else None
         self._mic_info = mic_info or {}
 
-        print(f"[DEBUG] Loopback: {loopback_info['name']} — "
-              f"{int(loopback_info['maxInputChannels'])}ch "
-              f"{int(loopback_info['defaultSampleRate'])}Hz "
-              f"idx={int(loopback_info['index'])}")
+        if self.mic_only and mic_info is None:
+            raise RuntimeError("Mic-only mode requires --mic/-m to be specified.")
+
         if mic_info:
-            print(f"[DEBUG] Mic: {mic_info['name']} — "
+            print(f"Mic: {mic_info['name']} — "
                   f"{int(mic_info['maxInputChannels'])}ch "
                   f"{int(mic_info['defaultSampleRate'])}Hz "
                   f"idx={int(mic_info['index'])}")
 
         self._recording = True
 
-        # Use blocking reads in a thread — WASAPI loopback in callback mode
-        # does not fire callbacks during silence, so blocking reads are more reliable.
-        self._loopback_stream = self._p.open(
-            format=self.FORMAT,
-            channels=int(loopback_info["maxInputChannels"]),
-            rate=int(loopback_info["defaultSampleRate"]),
-            input=True,
-            input_device_index=int(loopback_info["index"]),
-            frames_per_buffer=self.CHUNK_SIZE,
-        )
-        print("[DEBUG] Loopback stream open.")
+        if loopback_info is not None:
+            self._loopback_stream = self._p.open(
+                format=self.FORMAT,
+                channels=int(loopback_info["maxInputChannels"]),
+                rate=int(loopback_info["defaultSampleRate"]),
+                input=True,
+                input_device_index=int(loopback_info["index"]),
+                frames_per_buffer=self.CHUNK_SIZE,
+            )
+            print("Loopback stream open.")
 
-        def _loopback_worker():
-            while self._recording:
-                try:
-                    data = self._loopback_stream.read(
-                        self.CHUNK_SIZE, exception_on_overflow=False
-                    )
-                    self._loopback_frames.append(data)
-                except Exception:
-                    break
+            stop_event = self._stop_event
 
-        self._loopback_thread = threading.Thread(target=_loopback_worker, daemon=True)
-        self._loopback_thread.start()
+            def _loopback_worker():
+                while not stop_event.is_set():
+                    try:
+                        data = self._loopback_stream.read(
+                            self.CHUNK_SIZE, exception_on_overflow=False
+                        )
+                        self._loopback_frames.append(data)
+                    except Exception:
+                        break
+
+            self._loopback_thread = threading.Thread(target=_loopback_worker, daemon=True)
+            self._loopback_thread.start()
 
         if mic_info:
             def _mic_cb(in_data, frame_count, time_info, status):
@@ -136,27 +148,37 @@ class AudioRecorder:
                 stream_callback=_mic_cb,
             )
             self._mic_stream.start_stream()
-            print("[DEBUG] Mic stream open.")
+            print("Mic stream open.")
 
         return self._output_path
 
     def stop(self) -> Path:
         self._recording = False
+        self._stop_event.set()
 
+        # Stop mic stream (callback-based, safe to stop from main thread)
+        if self._mic_stream is not None:
+            try:
+                self._mic_stream.stop_stream()
+                self._mic_stream.close()
+            except Exception:
+                pass
+            self._mic_stream = None
+
+        # For loopback: join the thread first (stop_event signals it to exit),
+        # then close the stream. This avoids closing the stream while read() is
+        # executing on the background thread, which causes a GIL crash.
         if self._loopback_thread is not None:
-            self._loopback_thread.join(timeout=3)
+            self._loopback_thread.join(timeout=2)
             self._loopback_thread = None
 
-        for stream in (self._loopback_stream, self._mic_stream):
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except Exception:
-                    pass
-
-        self._loopback_stream = None
-        self._mic_stream = None
+        if self._loopback_stream is not None:
+            try:
+                self._loopback_stream.stop_stream()
+                self._loopback_stream.close()
+            except Exception:
+                pass
+            self._loopback_stream = None
 
         if self._p is not None:
             try:
@@ -165,13 +187,10 @@ class AudioRecorder:
                 pass
             self._p = None
 
-        print(f"[DEBUG] Captured {len(self._loopback_frames)} loopback frames, "
-              f"{len(self._mic_frames)} mic frames.")
-
         if not self._loopback_frames and not self._mic_frames:
             raise RuntimeError("No audio frames captured from any device.")
 
-        if not self._loopback_frames:
+        if not self.mic_only and not self._loopback_frames:
             print("[WARNING] No loopback frames captured — saving mic-only audio. "
                   "Loopback only records audio that plays through the speakers; "
                   "make sure meeting audio was active during recording.")
@@ -190,8 +209,7 @@ class AudioRecorder:
             if p.get_device_info_by_index(i).get("isLoopbackDevice", False)
         ]
 
-        print(f"[DEBUG] Found {len(loopbacks)} loopback devices: "
-              f"{[int(d['index']) for d in loopbacks]}")
+        print(f"Found {len(loopbacks)} loopback devices: {[int(d['index']) for d in loopbacks]}")
 
         if self.device_index is not None:
             match = next((d for d in loopbacks if int(d["index"]) == self.device_index), None)

@@ -29,17 +29,21 @@ def cli():
 @click.option("--no-notion", is_flag=True, help="Skip Notion export (transcript + summary only)")
 @click.option("--whisper-model", default=None, help="Whisper model size (tiny/base/small/medium/large-v2)")
 @click.option("--device", "-d", default=None, type=int, help="Loopback device index (see list-devices)")
-@click.option("--mic", "-m", default=None, type=int, help="Microphone device index to mix in (see list-devices)")
+@click.option("--mic", "-m", default=None, type=int, help="Microphone device index (see list-devices)")
 def record(title: str | None, no_notion: bool, whisper_model: str | None, device: int | None, mic: int | None):
     """Record system audio. Press Enter to stop and process."""
     from .config import settings
     from .recorder import AudioRecorder
+
+    # Only mic specified → mic-only mode (no loopback)
+    mic_only = mic is not None and device is None
 
     recorder = AudioRecorder(
         output_dir=settings.output_dir,
         sample_rate=settings.audio_sample_rate,
         device_index=device,
         mic_device_index=mic,
+        mic_only=mic_only,
     )
 
     audio_path = recorder.start()
@@ -66,6 +70,9 @@ def record(title: str | None, no_notion: bool, whisper_model: str | None, device
     except KeyboardInterrupt:
         pass
 
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     console.print("[yellow]Stopping...[/]")
     audio_path = recorder.stop()
     console.print(f"[green]Audio saved:[/] {audio_path}")
@@ -76,6 +83,8 @@ def record(title: str | None, no_notion: bool, whisper_model: str | None, device
         no_notion=no_notion,
         whisper_model=whisper_model,
     )
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 @cli.command()

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($env:PATH -split \";\" | Where-Object { $_ -match \"python|py\" -or \\(Test-Path \"$_\\\\python.exe\"\\) })"
+    ]
+  }
+}

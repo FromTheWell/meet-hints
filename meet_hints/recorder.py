@@ -1,3 +1,4 @@
+import threading
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ class AudioRecorder:
         self._mic_info: dict = {}
         self._loopback_stream = None
         self._mic_stream = None
+        self._loopback_thread: threading.Thread | None = None
         self._p: pyaudio.PyAudio | None = None
         self._output_path: Path | None = None
 
@@ -66,11 +68,7 @@ class AudioRecorder:
             p.terminate()
 
     def start(self) -> Path:
-        """Open streams in the main thread, then return immediately.
-
-        PortAudio drives the callbacks in its own internal threads — no
-        extra Python threads are needed or safe to use for WASAPI streams.
-        """
+        """Open streams and start capturing. Returns the output path immediately."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._output_path = self.output_dir / f"meeting_{timestamp}.wav"
         self._loopback_frames = []
@@ -96,12 +94,8 @@ class AudioRecorder:
 
         self._recording = True
 
-        def _loopback_cb(in_data, frame_count, time_info, status):
-            if self._recording:
-                self._loopback_frames.append(in_data)
-                return (None, pyaudio.paContinue)
-            return (None, pyaudio.paComplete)
-
+        # Use blocking reads in a thread — WASAPI loopback in callback mode
+        # does not fire callbacks during silence, so blocking reads are more reliable.
         self._loopback_stream = self._p.open(
             format=self.FORMAT,
             channels=int(loopback_info["maxInputChannels"]),
@@ -109,10 +103,21 @@ class AudioRecorder:
             input=True,
             input_device_index=int(loopback_info["index"]),
             frames_per_buffer=self.CHUNK_SIZE,
-            stream_callback=_loopback_cb,
         )
-        self._loopback_stream.start_stream()
         print("[DEBUG] Loopback stream open.")
+
+        def _loopback_worker():
+            while self._recording:
+                try:
+                    data = self._loopback_stream.read(
+                        self.CHUNK_SIZE, exception_on_overflow=False
+                    )
+                    self._loopback_frames.append(data)
+                except Exception:
+                    break
+
+        self._loopback_thread = threading.Thread(target=_loopback_worker, daemon=True)
+        self._loopback_thread.start()
 
         if mic_info:
             def _mic_cb(in_data, frame_count, time_info, status):
@@ -138,6 +143,10 @@ class AudioRecorder:
     def stop(self) -> Path:
         self._recording = False
 
+        if self._loopback_thread is not None:
+            self._loopback_thread.join(timeout=3)
+            self._loopback_thread = None
+
         for stream in (self._loopback_stream, self._mic_stream):
             if stream is not None:
                 try:
@@ -159,11 +168,13 @@ class AudioRecorder:
         print(f"[DEBUG] Captured {len(self._loopback_frames)} loopback frames, "
               f"{len(self._mic_frames)} mic frames.")
 
+        if not self._loopback_frames and not self._mic_frames:
+            raise RuntimeError("No audio frames captured from any device.")
+
         if not self._loopback_frames:
-            raise RuntimeError(
-                "No audio frames captured from loopback device. "
-                "Make sure audio is playing and the correct device is selected."
-            )
+            print("[WARNING] No loopback frames captured — saving mic-only audio. "
+                  "Loopback only records audio that plays through the speakers; "
+                  "make sure meeting audio was active during recording.")
 
         self._save_wav()
         return self._output_path
@@ -230,19 +241,26 @@ class AudioRecorder:
         return audio
 
     def _save_wav(self):
-        loopback_audio = self._to_mono_16k(self._loopback_frames, self._loopback_info)
+        if self._loopback_frames:
+            loopback_audio = self._to_mono_16k(self._loopback_frames, self._loopback_info)
+        else:
+            loopback_audio = None
 
         if self._mic_frames and self._mic_info:
             mic_audio = self._to_mono_16k(self._mic_frames, self._mic_info)
+        else:
+            mic_audio = None
+
+        if loopback_audio is not None and mic_audio is not None:
             min_len = min(len(loopback_audio), len(mic_audio))
-            loopback_audio = loopback_audio[:min_len]
-            mic_audio = mic_audio[:min_len]
             mixed = np.clip(
-                loopback_audio.astype(np.int32) + mic_audio.astype(np.int32),
+                loopback_audio[:min_len].astype(np.int32) + mic_audio[:min_len].astype(np.int32),
                 -32768, 32767,
             ).astype(np.int16)
-        else:
+        elif loopback_audio is not None:
             mixed = loopback_audio
+        else:
+            mixed = mic_audio
 
         with wave.open(str(self._output_path), "wb") as wf:
             wf.setnchannels(1)

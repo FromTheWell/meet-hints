@@ -6,8 +6,10 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.text import Text
 
 console = Console()
 
@@ -45,11 +47,22 @@ def record(title: str | None, no_notion: bool, whisper_model: str | None, device
     import time
     time.sleep(0.3)  # give threads time to open streams
 
-    console.print(Panel("[bold green]Recording started[/] — press [bold]Ctrl+C[/] to stop."))
+    start_time = time.time()
+
+    def _elapsed() -> Text:
+        elapsed = int(time.time() - start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        timestamp = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        return Text.from_markup(
+            f"[bold red]● REC[/]  [bold]{timestamp}[/]  — press [bold]Ctrl+C[/] to stop."
+        )
 
     try:
-        while True:
-            time.sleep(0.5)
+        with Live(_elapsed(), refresh_per_second=2, console=console) as live:
+            while True:
+                time.sleep(0.5)
+                live.update(_elapsed())
     except KeyboardInterrupt:
         pass
 

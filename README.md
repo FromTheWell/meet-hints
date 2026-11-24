@@ -1,5 +1,8 @@
 # meet-hints
 
+<img width="400" height="400" alt="meet-hints" src="https://github.com/user-attachments/assets/ad6ed6d5-827a-4fb4-bda6-efbd13f83764" />
+
+
 CLI tool that records meetings, transcribes audio with Whisper, analyzes the transcript with Claude, and exports a structured summary to Notion.
 
 ```
